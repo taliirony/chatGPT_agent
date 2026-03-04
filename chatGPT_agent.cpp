@@ -3,7 +3,8 @@
 // Monitors ChatGPT browser interactions for email in pasted text
 // and Google Drive-sourced file uploads.
 //
-// Build: cl /EHsc /std:c++17 chatGPT_agent.cpp ole32.lib oleaut32.lib shell32.lib shlwapi.lib user32.lib
+// Build:   set PATH=C:\msys64\ucrt64\bin;%PATH%
+//          g++ -std=c++17 -O2 -static -o chatGPT_agent.exe chatGPT_agent.cpp -lole32 -loleaut32 -lshell32 -lshlwapi -luser32 -luuid
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
