@@ -36,9 +36,8 @@ The agent runs in the foreground and logs to `chatGPT_agent.log` in the current 
 
 Detects email addresses in clipboard content pasted into ChatGPT via:
 
-- **Ctrl+V / Ctrl+Shift+V** keyboard shortcuts
-- **Right-click > Paste** context menu
-- **Clipboard change** while ChatGPT is in the foreground
+- **Ctrl+V / Ctrl+Shift+V** keyboard shortcuts (keyboard hook)
+- **Right-click > Paste** context menu (mouse hook)
 
 ### 2. Google Drive File Upload Blocking (File Dialog)
 
@@ -50,7 +49,7 @@ When a user opens a file-upload dialog from ChatGPT and selects a file that orig
 
 ### 3. Google Drive File Drag-and-Drop Detection
 
-Polls for drag-and-drop operations from Explorer to ChatGPT browser windows. When a Google Drive file is dragged over a ChatGPT window, the agent simulates an Escape keypress to cancel the drag.
+Detects drag-and-drop operations from Explorer to ChatGPT browser windows using event-driven mouse hook detection. When a Google Drive file is dragged over a ChatGPT window, the agent simulates an Escape keypress to cancel the drag.
 
 ## OS APIs Used
 
@@ -59,7 +58,7 @@ Polls for drag-and-drop operations from Explorer to ChatGPT browser windows. Whe
 | API | Purpose |
 |-----|---------|
 | `SetWindowsHookExW(WH_KEYBOARD_LL, ...)` | Low-level keyboard hook to intercept Ctrl+V paste keystrokes system-wide |
-| `SetWindowsHookExW(WH_MOUSE_LL, ...)` | Low-level mouse hook to detect right-click paste operations |
+| `SetWindowsHookExW(WH_MOUSE_LL, ...)` | Low-level mouse hook to detect right-click paste and drag-and-drop operations |
 | `CallNextHookEx` | Forwards hook events to the next handler in the chain |
 | `SendInput` | Simulates keyboard input (Escape key) to cancel drag-and-drop operations |
 
@@ -82,10 +81,8 @@ Polls for drag-and-drop operations from Explorer to ChatGPT browser windows. Whe
 
 | API | Purpose |
 |-----|---------|
-| `AddClipboardFormatListener` | Registers for `WM_CLIPBOARDUPDATE` notifications when clipboard content changes |
 | `OpenClipboard` / `CloseClipboard` | Accesses clipboard data |
 | `GetClipboardData(CF_UNICODETEXT)` | Reads text from the clipboard for email detection |
-| `GetClipboardSequenceNumber` | Tracks clipboard changes to avoid duplicate alerts |
 
 ### UI Automation (COM)
 
@@ -129,7 +126,6 @@ These are used during drag-and-drop detection to determine which files the user 
 |-----|---------|
 | `CreateFileW` | Opens files — used both for reading Zone.Identifier ADS and for exclusive file locking |
 | `ReadFile` | Reads the content of NTFS alternate data streams |
-| `ReadDirectoryChangesW` | Watches the Downloads folder for new files in real time |
 | `SHGetKnownFolderPath` | Locates the user's Downloads, Desktop, and Documents folders |
 | `QueryFullProcessImageNameW` | Gets the executable path of a process to identify `explorer.exe` |
 
@@ -139,7 +135,6 @@ These are used during drag-and-drop detection to determine which files the user 
 |-----|---------|
 | `GetWindowThreadProcessId` | Gets the process ID owning a window |
 | `OpenProcess` | Opens a process handle for querying its executable name |
-| `SetTimer` / `KillTimer` | Runs the 150ms drag-and-drop poll timer |
 | `SetConsoleCtrlHandler` | Handles Ctrl+C for graceful shutdown |
 
 ## How File Origin Detection Works
@@ -168,13 +163,13 @@ The agent reads this stream by opening `<filepath>:Zone.Identifier` and checking
 
 ### File Upload Blocking
 
-- **Race condition**: The agent polls the file dialog every 200ms. If the user double-clicks a file (which simultaneously selects and opens it), the dialog may close before the agent detects the filename. In this case, the agent detects and logs the event but may not prevent the upload.
+- **Race condition**: The agent polls the file dialog every 50ms. If the user double-clicks a file (which simultaneously selects and opens it), the dialog may close before the agent detects the filename. In this case, the agent detects and logs the event but may not prevent the upload.
 - **File locking timing**: The agent locks the file with exclusive access to prevent the browser from reading it. If the browser has already opened the file before the lock is acquired, the upload proceeds.
 - **Browser-dependent**: The file dialog detection relies on the standard Windows file dialog. Custom file pickers or browser-specific dialogs may not be detected.
 
 ### Drag-and-Drop Blocking
 
-- **Poll-based detection**: The drag-and-drop monitor polls every 150ms. Very fast drag-and-drop operations (drag and release within one poll interval) may not be caught in time to cancel.
+- **Event-driven detection**: The drag-and-drop monitor uses a low-level mouse hook to detect drag operations. It triggers when the mouse moves beyond a threshold while the button is held down over an Explorer window.
 - **Explorer selection vs. dragged file**: The agent queries the Explorer window's current selection, which normally matches the file being dragged. However, if multiple files are selected, all are checked.
 - **Escape simulation**: Cancelling a drag by simulating an Escape keypress is not guaranteed to work in all scenarios. If the drop completes before the Escape is processed, the agent can only alert after the fact.
 

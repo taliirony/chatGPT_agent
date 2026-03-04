@@ -3,8 +3,7 @@
 // Monitors ChatGPT browser interactions for email in pasted text
 // and Google Drive-sourced file uploads.
 //
-// Build: set PATH=C:\msys64\ucrt64\bin;%PATH%
-//        g++ -std=c++17 -O2 -static -o chatGPT_agent.exe chatGPT_agent.cpp -lole32 -loleaut32 -lshell32 -lshlwapi -luser32 -luuid
+// Build: g++ -std=c++17 -O2 -static -o chatGPT_agent.exe chatGPT_agent.cpp -lole32 -loleaut32 -lshell32 -lshlwapi -luser32 -luuid
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -83,10 +82,13 @@ static std::atomic<bool>   g_contextMenuOpen{false};
 static std::atomic<ULONGLONG> g_rightClickTime{0};
 
 // Drag-and-drop polling detection
-static const UINT_PTR  DRAG_POLL_TIMER_ID = 42;
-static const UINT      DRAG_POLL_INTERVAL = 150;   // ms
-static bool            g_dragBlocked = false;       // cooldown after blocking one drag
+// Drag-and-drop detection state (event-driven via mouse hook)
+static bool            g_dragActive = false;         // true while dragging from Explorer
+static bool            g_dragBlocked = false;        // already blocked this drag gesture
 static HWND            g_dragSourceExplorerHwnd = nullptr;  // Explorer window where drag started
+static POINT           g_dragStartPt = {};           // mouse-down position
+static const int       DRAG_THRESHOLD = 5;           // pixels before considered a drag
+static const UINT      WM_CHECK_DRAG = WM_USER + 1; // custom message for drag check
 
 // ============================================================
 // Utility helpers
@@ -455,40 +457,12 @@ static bool isChatGPTWindow(HWND hwnd) {
     return false;
 }
 
-// Poll-based drag detection: called every DRAG_POLL_INTERVAL ms.
-// When left mouse button is first pressed over an Explorer window, we
-// record that as the drag source. While dragging, if the cursor moves
-// over a ChatGPT window, we query ONLY the source Explorer window's
-// selection for Google Drive files.
-static void onDragPollTimer() {
-    bool lButtonDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+// Event-driven drag-drop detection: called from mouse hook on drop.
+// Checks if the file being dropped on ChatGPT is from Google Drive.
+static void checkDragDrop() {
+    if (!g_dragSourceExplorerHwnd) return;
 
-    if (!lButtonDown) {
-        // Mouse released — reset state
-        g_dragBlocked = false;
-        g_dragSourceExplorerHwnd = nullptr;
-        return;
-    }
-
-    // Already blocked this drag gesture — wait for mouse release
-    if (g_dragBlocked) return;
-
-    // If we haven't identified a drag source yet, check if cursor is
-    // currently over an Explorer window (this captures the start of drag)
-    if (!g_dragSourceExplorerHwnd) {
-        POINT pt;
-        GetCursorPos(&pt);
-        HWND hwndUnder = WindowFromPoint(pt);
-        if (!hwndUnder) return;
-        HWND topLevel = getTopLevelParent(hwndUnder);
-        if (isExplorerWindow(topLevel)) {
-            g_dragSourceExplorerHwnd = topLevel;
-        }
-        return;  // don't check on the same tick we identify the source
-    }
-
-    // We have a drag source Explorer window — check if cursor is now
-    // over a ChatGPT window
+    // Check if cursor is over a ChatGPT window
     POINT pt;
     GetCursorPos(&pt);
     HWND hwndUnder = WindowFromPoint(pt);
@@ -496,19 +470,9 @@ static void onDragPollTimer() {
     HWND topLevel = getTopLevelParent(hwndUnder);
     if (!isChatGPTWindow(topLevel)) return;
 
-    // Cursor is over ChatGPT while dragging from Explorer —
-    // query ONLY the source Explorer window's selection
+    // Cursor is over ChatGPT — query the source Explorer window's selection
     auto files = getExplorerSelectedFiles(g_dragSourceExplorerHwnd);
     if (files.empty()) return;
-
-    // Debug: log all files returned by Explorer selection query
-    g_logger->log("Debug: Drag poll - Explorer selection has " +
-                  std::to_string(files.size()) + " file(s):");
-    for (const auto& fp : files) {
-        bool ads = isFromGoogleDrive(fp);
-        g_logger->log("Debug:   " + wideToUtf8(fp) +
-                      " ads=" + (ads ? "Y" : "N"));
-    }
 
     bool hasDrive = false;
     std::string driveFile;
@@ -535,11 +499,13 @@ static void onDragPollTimer() {
     g_logger->log("Alert: Drive-sourced file drag-drop to ChatGPT blocked. file="
                   + driveFile);
 
-    MessageBoxW(nullptr,
-        L"Upload blocked: the dragged file originated from "
-        L"Google Drive and cannot be dropped into ChatGPT.",
-        L"ChatGPT Agent",
-        MB_OK | MB_ICONWARNING);
+    std::thread([]() {
+        MessageBoxW(nullptr,
+            L"Upload blocked: the dragged file originated from "
+            L"Google Drive and cannot be dropped into ChatGPT.",
+            L"ChatGPT Agent",
+            MB_OK | MB_ICONWARNING);
+    }).detach();
 }
 
 // ============================================================
@@ -598,41 +564,75 @@ static LRESULT CALLBACK keyboardHookProc(int nCode, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(g_keyboardHook, nCode, wp, lp);
 }
 
-// Mechanism 2: mouse hook — catches right-click > Paste menu selection
+// Mechanism 2: mouse hook — catches right-click paste and drag-and-drop
 static LRESULT CALLBACK mouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     if (nCode == HC_ACTION) {
-        if (wp == WM_RBUTTONDOWN) {
-            // Right-click detected — if ChatGPT is foreground, arm the
-            // context-menu tracker for up to 10 seconds
+        auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
+
+        if (wp == WM_LBUTTONDOWN) {
+            // Start potential drag — record position and check if over Explorer
+            g_dragStartPt = ms->pt;
+            g_dragActive = false;
+            g_dragBlocked = false;
+            g_dragSourceExplorerHwnd = nullptr;
+
+            HWND hwndUnder = WindowFromPoint(ms->pt);
+            if (hwndUnder) {
+                HWND topLevel = getTopLevelParent(hwndUnder);
+                if (isExplorerWindow(topLevel)) {
+                    g_dragSourceExplorerHwnd = topLevel;
+                }
+            }
+
+            // Right-click paste: left-click while context menu is armed
+            if (g_contextMenuOpen) {
+                ULONGLONG elapsed = GetTickCount64() - g_rightClickTime.load();
+                g_contextMenuOpen = false;
+                if (elapsed < 10000 && isChatGPTForeground()) {
+                    checkClipboardForEmail();
+                }
+            }
+        } else if (wp == WM_MOUSEMOVE) {
+            // Detect drag start: mouse moved beyond threshold while button held
+            if (g_dragSourceExplorerHwnd && !g_dragActive && !g_dragBlocked) {
+                int dx = ms->pt.x - g_dragStartPt.x;
+                int dy = ms->pt.y - g_dragStartPt.y;
+                if (dx * dx + dy * dy > DRAG_THRESHOLD * DRAG_THRESHOLD) {
+                    g_dragActive = true;
+                }
+            }
+            // While dragging over ChatGPT, post message to check on main thread
+            if (g_dragActive && !g_dragBlocked) {
+                PostMessageW(g_hiddenWnd, WM_CHECK_DRAG, 0, 0);
+            }
+        } else if (wp == WM_LBUTTONUP) {
+            // Drop — final check on main thread
+            if (g_dragActive && !g_dragBlocked) {
+                PostMessageW(g_hiddenWnd, WM_CHECK_DRAG, 0, 0);
+            }
+            g_dragActive = false;
+            g_dragBlocked = false;
+            g_dragSourceExplorerHwnd = nullptr;
+        } else if (wp == WM_RBUTTONDOWN) {
+            // Right-click — arm context-menu tracker for paste detection
             if (isChatGPTForeground()) {
                 g_contextMenuOpen = true;
                 g_rightClickTime  = GetTickCount64();
-            }
-        } else if (wp == WM_LBUTTONDOWN && g_contextMenuOpen) {
-            // Left-click while context menu is armed — user may have
-            // clicked "Paste".  Check clipboard for email.
-            ULONGLONG elapsed = GetTickCount64() - g_rightClickTime.load();
-            g_contextMenuOpen = false;
-            if (elapsed < 10000) {  // within 10 seconds of right-click
-                if (isChatGPTForeground()) {
-                    checkClipboardForEmail();
-                }
             }
         }
     }
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 }
 
-// Window proc for hidden window (handles drag-poll timer)
+// Window proc for hidden window
 static LRESULT CALLBACK clipWndProc(HWND hwnd, UINT msg,
                                     WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_TIMER: {
-        if (wp == DRAG_POLL_TIMER_ID) {
-            onDragPollTimer();
+    case WM_CHECK_DRAG:
+        if (g_dragActive && !g_dragBlocked) {
+            checkDragDrop();
         }
         break;
-    }
     case WM_DESTROY:
         PostQuitMessage(0);
         break;
@@ -1117,12 +1117,9 @@ int main() {
                       "right-click paste detection unavailable.");
     }
 
-    // Start poll timer for drag-and-drop detection
-    SetTimer(g_hiddenWnd, DRAG_POLL_TIMER_ID, DRAG_POLL_INTERVAL, nullptr);
-
     g_logger->log("Info: Paste monitoring active (keyboard + mouse hooks).");
     g_logger->log("Info: File-dialog monitoring active.");
-    g_logger->log("Info: Drag-drop monitoring active.");
+    g_logger->log("Info: Drag-drop monitoring active (mouse hook).");
     g_logger->log("Info: Agent running – press Ctrl+C to stop.");
 
     std::cout << "ChatGPT Agent running.  Log: chatGPT_agent.log\n"
@@ -1141,7 +1138,6 @@ int main() {
         }
     }
 
-    KillTimer(g_hiddenWnd, DRAG_POLL_TIMER_ID);
     if (g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
