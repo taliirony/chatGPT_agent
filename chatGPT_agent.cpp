@@ -3,8 +3,8 @@
 // Monitors ChatGPT browser interactions for email in pasted text
 // and Google Drive-sourced file uploads.
 //
-// Build:   set PATH=C:\msys64\ucrt64\bin;%PATH%
-//          g++ -std=c++17 -O2 -static -o chatGPT_agent.exe chatGPT_agent.cpp -lole32 -loleaut32 -lshell32 -lshlwapi -luser32 -luuid
+// Build: set PATH=C:\msys64\ucrt64\bin;%PATH%
+//        g++ -std=c++17 -O2 -static -o chatGPT_agent.exe chatGPT_agent.cpp -lole32 -loleaut32 -lshell32 -lshlwapi -luser32 -luuid
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -77,11 +77,6 @@ static HHOOK g_keyboardHook = nullptr;
 static HHOOK g_mouseHook    = nullptr;
 // Hidden window handle (needed to open clipboard)
 static HWND  g_hiddenWnd    = nullptr;
-
-// Track last clipboard sequence number to detect clipboard changes
-// that happen while ChatGPT is in the foreground (covers right-click paste)
-static DWORD g_lastAlertedClipSeq = 0;
-static std::mutex g_clipSeqMtx;
 
 // Right-click context menu tracking
 static std::atomic<bool>   g_contextMenuOpen{false};
@@ -548,20 +543,16 @@ static void onDragPollTimer() {
 }
 
 // ============================================================
-// Paste monitor — two complementary mechanisms:
+// Paste monitor — two mechanisms:
 //
 //   1) Low-level keyboard hook (Ctrl+V / Ctrl+Shift+V)
-//      Fires on every paste keystroke → alerts even when the
-//      same clipboard content is pasted multiple times.
+//      Fires on every paste keystroke.
 //
-//   2) Clipboard-change listener (WM_CLIPBOARDUPDATE)
-//      Fires when clipboard content changes while ChatGPT is
-//      the foreground window → catches right-click paste and
-//      any other non-keyboard paste method, because the user
-//      must have copied/cut first (which changes the clipboard).
+//   2) Low-level mouse hook (right-click > Paste)
+//      Detects right-click followed by left-click (menu selection)
+//      while ChatGPT is in the foreground.
 //
-//   Together they cover: Ctrl+V, Ctrl+Shift+V, right-click
-//   paste, and menu Edit > Paste.
+//   Both read the clipboard directly at paste time.
 // ============================================================
 
 // Read clipboard text and check for email addresses
@@ -600,11 +591,6 @@ static LRESULT CALLBACK keyboardHookProc(int nCode, WPARAM wp, LPARAM lp) {
                           + (chatgpt ? "Y" : "N")
                           + " fg=" + title);
             if (chatgpt) {
-                DWORD seq = GetClipboardSequenceNumber();
-                {
-                    std::lock_guard<std::mutex> lk(g_clipSeqMtx);
-                    g_lastAlertedClipSeq = seq;
-                }
                 checkClipboardForEmail();
             }
         }
@@ -637,26 +623,10 @@ static LRESULT CALLBACK mouseHookProc(int nCode, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(g_mouseHook, nCode, wp, lp);
 }
 
-// Mechanism 3: clipboard-change listener — catches right-click paste
-// by alerting when clipboard changes while ChatGPT is in the foreground.
+// Window proc for hidden window (handles drag-poll timer)
 static LRESULT CALLBACK clipWndProc(HWND hwnd, UINT msg,
                                     WPARAM wp, LPARAM lp) {
     switch (msg) {
-    case WM_CLIPBOARDUPDATE: {
-        if (!isChatGPTForeground()) break;
-
-        // Avoid double-alerting if the keyboard hook already fired
-        // for this same clipboard content
-        DWORD seq = GetClipboardSequenceNumber();
-        {
-            std::lock_guard<std::mutex> lk(g_clipSeqMtx);
-            if (seq == g_lastAlertedClipSeq) break;   // already handled
-            g_lastAlertedClipSeq = seq;
-        }
-
-        checkClipboardForEmail();
-        break;
-    }
     case WM_TIMER: {
         if (wp == DRAG_POLL_TIMER_ID) {
             onDragPollTimer();
@@ -664,7 +634,6 @@ static LRESULT CALLBACK clipWndProc(HWND hwnd, UINT msg,
         break;
     }
     case WM_DESTROY:
-        RemoveClipboardFormatListener(hwnd);
         PostQuitMessage(0);
         break;
     default:
@@ -1131,12 +1100,6 @@ int main() {
         return 1;
     }
     g_hiddenWnd = hwnd;
-
-    // Register clipboard change listener (for right-click paste coverage)
-    if (!AddClipboardFormatListener(hwnd)) {
-        g_logger->log("Warning: AddClipboardFormatListener failed; "
-                      "right-click paste detection unavailable.");
-    }
 
     // Install low-level keyboard hook (for Ctrl+V paste detection)
     g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardHookProc,
